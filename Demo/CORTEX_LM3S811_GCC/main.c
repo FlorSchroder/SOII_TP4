@@ -24,45 +24,26 @@
  *
  */
 
-
 /*
- * This project contains an application demonstrating the use of the
- * FreeRTOS.org mini real time scheduler on the Luminary Micro LM3S811 Eval
- * board.  See http://www.FreeRTOS.org for more information.
- *
- * main() simply sets up the hardware, creates all the demo application tasks,
- * then starts the scheduler.  http://www.freertos.org/a00102.html provides
- * more information on the standard demo tasks.
- *
- * In addition to a subset of the standard demo application tasks, main.c also
- * defines the following tasks:
- *
- * + A 'Print' task.  The print task is the only task permitted to access the
- * LCD - thus ensuring mutual exclusion and consistent access to the resource.
- * Other tasks do not access the LCD directly, but instead send the text they
- * wish to display to the print task.  The print task spends most of its time
- * blocked - only waking when a message is queued for display.
- *
- * + A 'Button handler' task.  The eval board contains a user push button that
- * is configured to generate interrupts.  The interrupt handler uses a
- * semaphore to wake the button handler task - demonstrating how the priority
- * mechanism can be used to defer interrupt processing to the task level.  The
- * button handler task sends a message both to the LCD (via the print task) and
- * the UART where it can be viewed using a dumb terminal (via the UART to USB
- * converter on the eval board).  NOTES:  The dumb terminal must be closed in
- * order to reflash the microcontroller.  A very basic interrupt driven UART
- * driver is used that does not use the FIFO.  19200 baud is used.
- *
- * + A 'check' task.  The check task only executes every five seconds but has a
- * high priority so is guaranteed to get processor time.  Its function is to
- * check that all the other tasks are still operational and that no errors have
- * been detected at any time.  If no errors have every been detected 'PASS' is
- * written to the display (via the print task) - if an error has ever been
- * detected the message is changed to 'FAIL'.  The position of the message is
- * changed for each write.
- */
+* Se pide que, utilizando qemu, emulando un sistema Stellaris LM3S811, se
+* desarrolle una aplicaci´on basada en FreeRTOS que contenga las siguientes
+* caracter´ısticas.
+* 1. Una tarea que simule un sensor de temperatura. Generando valores aleatorios, con una frecuencia de 10 Hz. 
+* 2. Una tarea que reciba los valores del sensor y aplique un filtro pasa bajos.
+* Donde cada valor resultante es el promedio de las ultimas N mediciones.
+* 3. Una tarea que grafica en el display los valores de temperatura en el tiempo.
+* 4. Se debe poder recibir comandos por la interfaz UART para cambiar el N
+* del filtro.
+* 5. Calcular el stack necesario para cada task. Realizar el an´alisis utilizando
+* uxTaskGetStackHighWaterMark o vApplicationStackOverflowHook.
+* 6. Implementar una tarea tipo top de linux, que muestre peri´odicamente
+* estad´ısticas de las tareas (uso de cpu, uso de memoria, etc).
+* 
+*/
 
-
+/* Standard includes. */
+#include <stdio.h>
+#include <stdlib.h>
 
 /* Environment includes. */
 #include "DriverLib.h"
@@ -80,7 +61,8 @@
 #include "BlockQ.h"
 
 /* Delay between cycles of the 'check' task. */
-#define mainCHECK_DELAY						( ( TickType_t ) 5000 / portTICK_PERIOD_MS )
+#define mainCHECK_DELAY						( ( TickType_t ) 5000 / portTICK_PERIOD_MS ) 
+#define tempSENSOR_DELAY					( ( TickType_t ) 100 / portTICK_PERIOD_MS )  // Frecuencia de 10Hz
 
 /* UART configuration - note this does not use the FIFO so is not very
 efficient. */
@@ -100,6 +82,11 @@ efficient. */
 #define mainQUEUE_SIZE				( 3 )
 #define mainDEBOUNCE_DELAY			( ( TickType_t ) 150 / portTICK_PERIOD_MS )
 #define mainNO_DELAY				( ( TickType_t ) 0 )
+
+/* Temp */
+#define MAX_TEMP 40
+#define MAX_TEMP_STRING_LENGTH 10
+
 /*
  * Configure the processor and peripherals for this demo.
  */
@@ -110,16 +97,16 @@ static void prvSetupHardware( void );
  */
 static void vCheckTask( void *pvParameters );
 
-/*
- * The task that is woken by the ISR that processes GPIO interrupts originating
- * from the push button.
- */
-static void vButtonHandlerTask( void *pvParameters );
 
 /*
  * The task that controls access to the LCD.
  */
 static void vPrintTask( void *pvParameter );
+
+/*
+ * The task that simulates a temperature sensor.
+ */
+static void vTempSensorTask( void *pvParameters );
 
 /* String that is transmitted on the UART. */
 static char *cMessage = "Task woken by button interrupt! --- ";
@@ -155,8 +142,8 @@ int main( void )
 
 	/* Start the tasks defined within the file. */
 	xTaskCreate( vCheckTask, "Check", configMINIMAL_STACK_SIZE, NULL, mainCHECK_TASK_PRIORITY, NULL );
-	xTaskCreate( vButtonHandlerTask, "Status", configMINIMAL_STACK_SIZE, NULL, mainCHECK_TASK_PRIORITY + 1, NULL );
 	xTaskCreate( vPrintTask, "Print", configMINIMAL_STACK_SIZE, NULL, mainCHECK_TASK_PRIORITY - 1, NULL );
+	xTaskCreate( vTempSensorTask, "Temp", configMINIMAL_STACK_SIZE, NULL, mainCHECK_TASK_PRIORITY - 2, NULL );
 
 	/* Start the scheduler. */
 	vTaskStartScheduler();
@@ -226,16 +213,6 @@ static void prvSetupHardware( void )
 	/* Setup the PLL. */
 	SysCtlClockSet( SYSCTL_SYSDIV_10 | SYSCTL_USE_PLL | SYSCTL_OSC_MAIN | SYSCTL_XTAL_6MHZ );
 
-	/* Setup the push button. */
-	SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOC);
-    GPIODirModeSet(GPIO_PORTC_BASE, mainPUSH_BUTTON, GPIO_DIR_MODE_IN);
-	GPIOIntTypeSet( GPIO_PORTC_BASE, mainPUSH_BUTTON,GPIO_FALLING_EDGE );
-	IntPrioritySet( INT_GPIOC, configKERNEL_INTERRUPT_PRIORITY );
-	GPIOPinIntEnable( GPIO_PORTC_BASE, mainPUSH_BUTTON );
-	IntEnable( INT_GPIOC );
-
-
-
 	/* Enable the UART.  */
 	SysCtlPeripheralEnable(SYSCTL_PERIPH_UART0);
 	SysCtlPeripheralEnable(SYSCTL_PERIPH_GPIOA);
@@ -264,40 +241,6 @@ static void prvSetupHardware( void )
 }
 /*-----------------------------------------------------------*/
 
-static void vButtonHandlerTask( void *pvParameters )
-{
-const char *pcInterruptMessage = "Int";
-
-	for( ;; )
-	{
-		/* Wait for a GPIO interrupt to wake this task. */
-		while( xSemaphoreTake( xButtonSemaphore, portMAX_DELAY ) != pdPASS );
-
-		/* Start the Tx of the message on the UART. */
-		UARTIntDisable( UART0_BASE, UART_INT_TX );
-		{
-			pcNextChar = cMessage;
-
-			/* Send the first character. */
-			if( !( HWREG( UART0_BASE + UART_O_FR ) & UART_FR_TXFF ) )
-			{
-				HWREG( UART0_BASE + UART_O_DR ) = *pcNextChar;
-			}
-
-			pcNextChar++;
-		}
-		UARTIntEnable(UART0_BASE, UART_INT_TX);
-
-		/* Queue a message for the print task to display on the LCD. */
-		xQueueSend( xPrintQueue, &pcInterruptMessage, portMAX_DELAY );
-
-		/* Make sure we don't process bounces. */
-		vTaskDelay( mainDEBOUNCE_DELAY );
-		xSemaphoreTake( xButtonSemaphore, mainNO_DELAY );
-	}
-}
-
-/*-----------------------------------------------------------*/
 
 void vUART_ISR(void)
 {
@@ -357,3 +300,21 @@ unsigned portBASE_TYPE uxLine = 0, uxRow = 0;
 	}
 }
 
+/*-----------------------------------------------------------*/
+
+static void vTempSensorTask( void *pvParameters )
+{
+    int temp;
+    char tempString[MAX_TEMP_STRING_LENGTH];
+    for( ;; )
+    {
+        /* Simulate a temperature sensor. */
+        temp = rand() % MAX_TEMP;
+        /* Convert the temperature to a string. */
+        snprintf(tempString, MAX_TEMP_STRING_LENGTH, "Temp: %d", temp);
+        /* Send the temperature string to the print task. */
+        xQueueSend( xPrintQueue, &tempString, portMAX_DELAY );
+        /* Wait for the next cycle. */
+        vTaskDelay( tempSENSOR_DELAY );
+    }
+}
